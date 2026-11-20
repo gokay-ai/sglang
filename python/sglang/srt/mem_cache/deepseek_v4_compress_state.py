@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4StateBufferInfo
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -79,27 +80,6 @@ class KVAndScore:
             )
 
         return KVAndScore(torch.cat([v.kv_score for v in tensors], dim=dim))
-
-
-def c4_state_transfer_indices(
-    req_pool_idx: int,
-    seq_len: int,
-    *,
-    ring_size: int,
-) -> np.ndarray:
-    """PD transfer rows of the overlap C4 state: the live tail of the request's ring."""
-    # Prefill and decode can have different ring sizes (8 or 16 with EAGLE/MTP);
-    # pair the overlap compressor's live rows by logical token position.
-    if ring_size < 8 or ring_size % 4 != 0:
-        raise ValueError(
-            f"C4 ring_size must be a multiple of 4 and at least 8, got {ring_size}"
-        )
-
-    seq_len = max(0, int(seq_len))
-    state_len = seq_len % 4 + 4
-    positions = np.arange(max(0, seq_len - state_len), seq_len, dtype=np.int64)
-    rows = int(req_pool_idx) * int(ring_size) + positions % int(ring_size)
-    return rows.astype(np.int32)
 
 
 def request_scoped_state_transfer_indices(
@@ -183,20 +163,38 @@ class CompressStatePool:
             dtype=dtype, device=device, enable_memory_saver=enable_memory_saver
         )
         if not online:
-            if _is_hip and ratio == 128:
-                # Request-scoped C128 state is addressed by req_pool_idx (or a
-                # per-request ring).  The pool is allocated with torch.empty(),
-                # so a cold server can otherwise read uninitialized partial
-                # states before a request slot has been written for the first
-                # time.  Initialize all C128 rows to the empty-state sentinel;
-                # C4 keeps the historical last-row sentinel behavior.
+            if ratio == 2 or (_is_hip and ratio == 128):
+                # Request-scoped rings reset all rows; C4 only its -1 sentinel row.
                 self.kv_score_buffer.clear()
             else:
                 self.kv_score_buffer[-1].clear()
 
+    def checkpoint_buffer_info(self) -> DSV4StateBufferInfo:
+        """Expose whole page-owned rings without copying their backing storage."""
+        if self.request_scoped:
+            raise ValueError("Request-scoped compressor state is not checkpointed")
+        state = self.kv_score_buffer.kv_score
+        if not state.is_contiguous():
+            raise ValueError("Compressor checkpoint state must be contiguous")
+        page_bytes = self.ring_size * state[0].nbytes
+        usable_slots = state.shape[0] // self.ring_size * self.ring_size
+        pages = (
+            state.view(torch.uint8)
+            .reshape(state.shape[0], -1)[:usable_slots]
+            .reshape(-1, page_bytes)
+        )
+        return DSV4StateBufferInfo(
+            pages=pages, ring_size=self.ring_size, dtype=state.dtype
+        )
+
     def transfer_indices(self, req_pool_idx: int, seq_len: int) -> np.ndarray:
         """PD transfer indices of this pool's state for one request."""
         assert self.request_scoped, "page-scoped state travels with the SWA pages"
+        if self.ratio == 2:
+            # Only an odd prefix leaves a pending half-pair for decode to read.
+            if seq_len % 2 == 0:
+                return np.empty((0,), dtype=np.int32)
+            return np.array([int(req_pool_idx)], dtype=np.int32)
         return request_scoped_state_transfer_indices(
             req_pool_idx,
             seq_len,
@@ -262,15 +260,16 @@ class CompressStatePool:
     ) -> torch.Tensor:
         swa_pages = swa_loc // self.swa_page_size
         state_loc = swa_pages * self.ring_size + (swa_loc % self.ring_size)
-        state_loc = torch.where(swa_loc < 0, -1, state_loc)
-        return state_loc
+        # Not where(cond, -1, x): its scalar overload may stage a host tensor,
+        # which a CUDA graph capture cannot run.
+        return state_loc.masked_fill_(swa_loc < 0, -1)
 
     def translate_from_req_position_to_state_loc(
         self, req_pool_indices: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
         state_loc = req_pool_indices * self.ring_size + positions % self.ring_size
-        state_loc = torch.where(positions < 0, -1, state_loc)
-        return state_loc
+        # A negative position means "no slot"; it lands on the empty row -1.
+        return state_loc.masked_fill_(positions < 0, -1)
 
     def get_state_by_state_loc(self, state_loc: torch.Tensor) -> KVAndScore:
         return self.kv_score_buffer[state_loc]
